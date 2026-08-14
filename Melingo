@@ -1,0 +1,758 @@
+========================
+1. package.json
+========================
+
+{
+  "name": "milngo",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "db:push": "prisma db push",
+    "db:generate": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.13.0",
+    "bcryptjs": "^3.0.2",
+    "jose": "^6.0.12",
+    "next": "^15.4.6",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^4.0.15"
+  },
+  "devDependencies": {
+    "prisma": "^6.13.0",
+    "typescript": "^5.9.2",
+    "tailwindcss": "^4.1.11",
+    "@tailwindcss/postcss": "^4.1.11",
+    "@types/node": "^22.16.5",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7"
+  }
+}
+
+
+========================
+2. prisma/schema.prisma
+========================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  REVIEWED
+  RESOLVED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  dateOfBirth  DateTime
+  verified     Boolean  @default(false)
+  isAdmin      Boolean  @default(false)
+  suspended    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  profile     Profile?
+  photos      Photo[]
+  likesSent   Like[]   @relation("likesSent")
+  likesGot    Like[]   @relation("likesGot")
+  matchesA    Match[]  @relation("matchA")
+  matchesB    Match[]  @relation("matchB")
+  messages    Message[]
+  blocksSent  Block[]  @relation("blocksSent")
+  blocksGot   Block[]  @relation("blocksGot")
+  reportsSent Report[] @relation("reportsSent")
+}
+
+model Profile {
+  id         String @id @default(cuid())
+  userId     String @unique
+  name       String
+  city       String?
+  bio        String?
+  gender     Gender
+  preference String?
+  interests  String[]
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Photo {
+  id        String   @id @default(cuid())
+  userId    String
+  url       String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Like {
+  id         String   @id @default(cuid())
+  fromUserId String
+  toUserId   String
+  createdAt  DateTime @default(now())
+
+  fromUser User @relation("likesSent", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUser   User @relation("likesGot", fields: [toUserId], references: [id], onDelete: Cascade)
+
+  @@unique([fromUserId, toUserId])
+  @@index([toUserId])
+}
+
+model Match {
+  id        String   @id @default(cuid())
+  userAId   String
+  userBId   String
+  createdAt DateTime @default(now())
+
+  userA User @relation("matchA", fields: [userAId], references: [id], onDelete: Cascade)
+  userB User @relation("matchB", fields: [userBId], references: [id], onDelete: Cascade)
+
+  messages Message[]
+
+  @@unique([userAId, userBId])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  matchId   String
+  senderId  String
+  body      String
+  createdAt DateTime @default(now())
+
+  match  Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  sender User  @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([matchId, createdAt])
+}
+
+model Block {
+  id        String   @id @default(cuid())
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  blocker User @relation("blocksSent", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("blocksGot", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+}
+
+model Report {
+  id         String       @id @default(cuid())
+  reporterId String
+  reportedId String
+  reason     String
+  status     ReportStatus @default(OPEN)
+  createdAt  DateTime     @default(now())
+
+  reporter User @relation("reportsSent", fields: [reporterId], references: [id], onDelete: Cascade)
+  reported User @relation("reportsGot", fields: [reportedId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+
+========================
+3. .env
+========================
+
+DATABASE_URL="postgresql://postgres:password@localhost:5432/connect"
+JWT_SECRET="CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+
+
+========================
+4. lib/prisma.ts
+========================
+
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma =
+  globalThis as unknown as {
+    prisma: PrismaClient | undefined;
+  };
+
+export const db =
+  globalForPrisma.prisma ??
+  new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = db;
+}
+
+
+========================
+5. lib/auth.ts
+========================
+
+import { cookies } from "next/headers";
+import { SignJWT, jwtVerify } from "jose";
+import { db } from "./prisma";
+
+const secret = new TextEncoder().encode(
+  process.env.JWT_SECRET || "development-secret"
+);
+
+export async function createSession(userId: string) {
+  const token = await new SignJWT({ userId })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime("7d")
+    .sign(secret);
+
+  const cookieStore = await cookies();
+
+  cookieStore.set("connect_session", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 7
+  });
+}
+
+export async function getCurrentUser() {
+  const token =
+    (await cookies()).get("connect_session")?.value;
+
+  if (!token) return null;
+
+  try {
+    const { payload } = await jwtVerify(
+      token,
+      secret
+    );
+
+    if (typeof payload.userId !== "string") {
+      return null;
+    }
+
+    return await db.user.findUnique({
+      where: {
+        id: payload.userId
+      },
+      include: {
+        profile: true
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
+
+========================
+6. app/actions.ts
+========================
+
+"use server";
+
+import bcrypt from "bcryptjs";
+import { redirect } from "next/navigation";
+import { db } from "@/lib/prisma";
+import { createSession } from "@/lib/auth";
+
+function isAdult(date: Date) {
+  const today = new Date();
+
+  const cutoff = new Date(
+    today.getFullYear() - 18,
+    today.getMonth(),
+    today.getDate()
+  );
+
+  return date <= cutoff;
+}
+
+export async function signup(formData: FormData) {
+  const email = String(
+    formData.get("email") || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const password = String(
+    formData.get("password") || ""
+  );
+
+  const dobString = String(
+    formData.get("dateOfBirth") || ""
+  );
+
+  const confirmed =
+    formData.get("adultConfirm") === "on";
+
+  if (
+    !email ||
+    !password ||
+    !dobString ||
+    !confirmed
+  ) {
+    throw new Error(
+      "Please fill all fields."
+    );
+  }
+
+  if (password.length < 8) {
+    throw new Error(
+      "Password must contain at least 8 characters."
+    );
+  }
+
+  const dob = new Date(dobString);
+
+  if (Number.isNaN(dob.getTime())) {
+    throw new Error(
+      "Invalid date of birth."
+    );
+  }
+
+  if (!isAdult(dob)) {
+    throw new Error(
+      "Connect is available only to users aged 18 or older."
+    );
+  }
+
+  const existing =
+    await db.user.findUnique({
+      where: { email }
+    });
+
+  if (existing) {
+    throw new Error(
+      "Account already exists."
+    );
+  }
+
+  const passwordHash =
+    await bcrypt.hash(password, 12);
+
+  const user =
+    await db.user.create({
+      data: {
+        email,
+        passwordHash,
+        dateOfBirth: dob
+      }
+    });
+
+  await createSession(user.id);
+
+  redirect("/profile/setup");
+}
+
+export async function login(formData: FormData) {
+  const email = String(
+    formData.get("email") || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const password = String(
+    formData.get("password") || ""
+  );
+
+  const user =
+    await db.user.findUnique({
+      where: { email }
+    });
+
+  if (!user) {
+    throw new Error(
+      "Invalid email or password."
+    );
+  }
+
+  if (user.suspended) {
+    throw new Error(
+      "This account has been suspended."
+    );
+  }
+
+  const valid =
+    await bcrypt.compare(
+      password,
+      user.passwordHash
+    );
+
+  if (!valid) {
+    throw new Error(
+      "Invalid email or password."
+    );
+  }
+
+  await createSession(user.id);
+
+  redirect("/discover");
+}
+
+
+========================
+7. app/signup/page.tsx
+========================
+
+import { signup } from "../actions";
+
+export default function Signup() {
+  return (
+    <main className="min-h-screen flex items-center justify-center p-6">
+
+      <form
+        action={signup}
+        className="w-full max-w-md bg-white p-6 rounded-2xl border space-y-4"
+      >
+
+        <h1 className="text-3xl font-bold">
+          Create account
+        </h1>
+
+        <input
+          name="email"
+          type="email"
+          required
+          placeholder="Email"
+          className="w-full border rounded-xl p-3"
+        />
+
+        <input
+          name="password"
+          type="password"
+          minLength={8}
+          required
+          placeholder="Password"
+          className="w-full border rounded-xl p-3"
+        />
+
+        <input
+          name="dateOfBirth"
+          type="date"
+          required
+          className="w-full border rounded-xl p-3"
+        />
+
+        <label className="flex gap-2 text-sm">
+          <input
+            name="adultConfirm"
+            type="checkbox"
+            required
+          />
+
+          I confirm that I am 18 or older.
+        </label>
+
+        <button
+          type="submit"
+          className="w-full bg-black text-white rounded-xl p-3"
+        >
+          Create Account
+        </button>
+
+      </form>
+
+    </main>
+  );
+}
+
+
+========================
+8. app/login/page.tsx
+========================
+
+import { login } from "../actions";
+
+export default function Login() {
+  return (
+    <main className="min-h-screen flex items-center justify-center p-6">
+
+      <form
+        action={login}
+        className="w-full max-w-md bg-white p-6 rounded-2xl border space-y-4"
+      >
+
+        <h1 className="text-3xl font-bold">
+          Login
+        </h1>
+
+        <input
+          name="email"
+          type="email"
+          required
+          placeholder="Email"
+          className="w-full border rounded-xl p-3"
+        />
+
+        <input
+          name="password"
+          type="password"
+          required
+          placeholder="Password"
+          className="w-full border rounded-xl p-3"
+        />
+
+        <button
+          type="submit"
+          className="w-full bg-black text-white rounded-xl p-3"
+        >
+          Login
+        </button>
+
+      </form>
+
+    </main>
+  );
+}
+
+
+========================
+9. app/api/like/route.ts
+========================
+
+import { NextResponse } from "next/server";
+import { db } from "@/lib/prisma";
+import { getCurrentUser } from "@/lib/auth";
+
+export async function POST(req: Request) {
+
+  const user = await getCurrentUser();
+
+  if (!user || user.suspended) {
+    return NextResponse.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  const body = await req.json();
+
+  const targetId = body.targetId;
+
+  if (
+    typeof targetId !== "string" ||
+    targetId === user.id
+  ) {
+    return NextResponse.json(
+      { error: "Invalid user" },
+      { status: 400 }
+    );
+  }
+
+  const target =
+    await db.user.findUnique({
+      where: {
+        id: targetId
+      }
+    });
+
+  if (!target || target.suspended) {
+    return NextResponse.json(
+      { error: "User not found" },
+      { status: 404 }
+    );
+  }
+
+  const blocked =
+    await db.block.findFirst({
+      where: {
+        OR: [
+          {
+            blockerId: user.id,
+            blockedId: targetId
+          },
+          {
+            blockerId: targetId,
+            blockedId: user.id
+          }
+        ]
+      }
+    });
+
+  if (blocked) {
+    return NextResponse.json(
+      { error: "Blocked" },
+      { status: 403 }
+    );
+  }
+
+  await db.like.upsert({
+    where: {
+      fromUserId_toUserId: {
+        fromUserId: user.id,
+        toUserId: targetId
+      }
+    },
+
+    update: {},
+
+    create: {
+      fromUserId: user.id,
+      toUserId: targetId
+    }
+  });
+
+  const reverseLike =
+    await db.like.findUnique({
+      where: {
+        fromUserId_toUserId: {
+          fromUserId: targetId,
+          toUserId: user.id
+        }
+      }
+    });
+
+  if (reverseLike) {
+
+    const [userAId, userBId] =
+      [user.id, targetId].sort();
+
+    await db.match.upsert({
+
+      where: {
+        userAId_userBId: {
+          userAId,
+          userBId
+        }
+      },
+
+      update: {},
+
+      create: {
+        userAId,
+        userBId
+      }
+
+    });
+
+    return NextResponse.json({
+      matched: true
+    });
+  }
+
+  return NextResponse.json({
+    matched: false
+  });
+}
+
+
+========================
+10. app/api/block/route.ts
+========================
+
+import { NextResponse } from "next/server";
+import { db } from "@/lib/prisma";
+import { getCurrentUser } from "@/lib/auth";
+
+export async function POST(req: Request) {
+
+  const user = await getCurrentUser();
+
+  if (!user) {
+    return NextResponse.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  const { userId } =
+    await req.json();
+
+  if (
+    typeof userId !== "string" ||
+    userId === user.id
+  ) {
+    return NextResponse.json(
+      { error: "Invalid user" },
+      { status: 400 }
+    );
+  }
+
+  await db.block.upsert({
+
+    where: {
+      blockerId_blockedId: {
+        blockerId: user.id,
+        blockedId: userId
+      }
+    },
+
+    update: {},
+
+    create: {
+      blockerId: user.id,
+      blockedId: userId
+    }
+
+  });
+
+  return NextResponse.json({
+    success: true
+  });
+}
+
+
+========================
+11. app/api/report/route.ts
+========================
+
+import { NextResponse } from "next/server";
+import { db } from "@/lib/prisma";
+import { getCurrentUser } from "@/lib/auth";
+
+export async function POST(req: Request) {
+
+  const user = await getCurrentUser();
+
+  if (!user) {
+    return NextResponse.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  const {
+    userId,
+    reason
+  } = await req.json();
+
+  if (
+    typeof userId !== "string" ||
+    typeof reason !== "string" ||
+    reason.length < 3 ||
+    reason.length > 500 ||
+    userId === user.id
+  ) {
+    return NextResponse.json(
+      { error: "Invalid report" },
+      { status: 400 }
+    );
+  }
+
+  await db.report.create({
+    data: {
+      reporterId: user.id,
+      reportedId: userId,
+      reason
+    }
+  });
+
+  return NextResponse.json({
+    success: true
+  });
+}
